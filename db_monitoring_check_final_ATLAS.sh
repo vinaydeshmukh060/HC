@@ -1,14 +1,25 @@
 #!/bin/bash
 ###############################################################################
 # Script Name : db_monitoring_check.sh
-# Version     : 3.3.0
+# Version     : 3.2.2
 #
 # Author      : Vinay V Deshmukh
-# Date        : 2026-02-13
+# Date        : 2026-01-29
 #
 # Description :
 #   Comprehensive Oracle Database Health Check Script.
-#   (Original logic preserved. DGBroker validation added.)
+#   - PMON-driven detection of running databases
+#   - ORACLE_HOME resolved from /etc/oratab (lookup only)
+#   - RAC / Single Instance aware
+#   - CDB / PDB aware
+#   - HugePages validated using Oracle MOS Doc ID 401749.1
+#   - RAC instance status, services, load, LMS checks
+#   - Tablespace, blocking session, parameter consistency checks,RMAN config check for archivelog deletion
+#
+# Usage :
+#   ./db_hc_experi.sh -d <ORACLE_SID>
+#   ./db_hc_experi.sh --all
+#
 ###############################################################################
 
 set -euo pipefail
@@ -47,7 +58,7 @@ EOF
 }
 
 #######################################
-# PMON DISCOVERY
+# PMON-BASED DISCOVERY (SOURCE OF TRUTH)
 #######################################
 get_running_sids() {
   ps -ef | awk '
@@ -66,10 +77,10 @@ get_oracle_home() {
 }
 
 #######################################
-# RMAN ARCHIVELOG POLICY CHECK
+# RMAN ARCHIVELOG POLICY CHECK (ADDED)
 #######################################
 check_rman_archivelog_policy() {
-
+  # Ensure RMAN is available
   if ! command -v rman >/dev/null 2>&1; then
     report "WARNING" "RMAN not found in PATH – skipping ARCHIVELOG DELETION POLICY check"
     return
@@ -77,6 +88,8 @@ check_rman_archivelog_policy() {
 
   report "INFO" "Checking RMAN ARCHIVELOG DELETION POLICY"
 
+  # Capture RMAN SHOW ALL output
+  local RMAN_OUT
   RMAN_OUT=$(rman target / <<EOF
 set echo off;
 show all;
@@ -84,33 +97,18 @@ exit;
 EOF
 )
 
-  ACTUAL_LINE=$(printf '%s\n' "$RMAN_OUT" | \
-    grep -i '^CONFIGURE ARCHIVELOG DELETION POLICY' | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//')
-
-  [[ -z "$ACTUAL_LINE" ]] && {
-    report "CRITICAL" "RMAN ARCHIVELOG DELETION POLICY not configured"
-    return
-  }
-
-  EXPECTED="CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK;"
-
-  NORM_ACTUAL=$(echo "$ACTUAL_LINE" | tr '[:lower:]' '[:upper:]' | tr -s ' ')
-  NORM_EXPECTED=$(echo "$EXPECTED"  | tr '[:lower:]' '[:upper:]' | tr -s ' ')
-
-  [[ "$NORM_ACTUAL" == "$NORM_EXPECTED" ]] \
-    && report "OK" "RMAN: $ACTUAL_LINE" \
-    || report "CRITICAL" "RMAN ARCHIVELOG DELETION POLICY mismatch"
-}
-
 #######################################
-# DGBROKER VALIDATION (FULL ADDITION)
+# DATA GUARD BROKER VALIDATION (ADDED)
 #######################################
 check_dg_broker() {
 
   BROKER=$(sql_exec "select value from v\$parameter where name='dg_broker_start';")
   [[ "$BROKER" != "TRUE" ]] && return
 
-  command -v dgmgrl >/dev/null 2>&1 || return
+  command -v dgmgrl >/dev/null 2>&1 || {
+    report "WARNING" "dgmgrl not found – skipping DG Broker check"
+    return
+  }
 
   report "INFO" "Checking Data Guard Broker configuration"
 
@@ -139,25 +137,25 @@ exit;
 EOF
 )
 
-    SW_READY=$(echo "$DG_OUT" | grep "Ready for Switchover:" | awk -F: '{print $2}' | xargs)
-    FO_READY=$(echo "$DG_OUT" | grep "Ready for Failover:" | awk -F: '{print $2}' | xargs)
+    ################ TEMP FILE MATCH ################
+    TEMP_BLOCK=$(echo "$DG_OUT" | awk '/Temporary Tablespace File Information:/,/Data file Online Move in Progress:/')
+    PRIMARY_TEMP=$(echo "$TEMP_BLOCK" | awk '/TEMP Files:/ {print $NF}' | head -1)
+    STBY_TEMP=$(echo "$TEMP_BLOCK" | awk '/TEMP Files:/ {print $NF}' | tail -1)
 
-    [[ "$SW_READY" == "Yes" ]] \
-      && report "OK" "[$STBY] Ready for Switchover" \
-      || report "WARNING" "[$STBY] Switchover: $SW_READY"
+    [[ "$PRIMARY_TEMP" == "$STBY_TEMP" ]] \
+      && report "OK" "[$STBY] TEMP files match ($PRIMARY_TEMP)" \
+      || report "CRITICAL" "[$STBY] TEMP mismatch Primary=$PRIMARY_TEMP Standby=$STBY_TEMP"
 
-    [[ "$FO_READY" == Yes* ]] \
-      && report "OK" "[$STBY] Ready for Failover" \
-      || report "CRITICAL" "[$STBY] Failover: $FO_READY"
-
+    ################ APPLY ################
     APPLY_STATE=$(echo "$DG_OUT" | grep "Apply State:" | awk -F: '{print $2}' | xargs)
     APPLY_LAG=$(echo "$DG_OUT" | grep "Apply Lag:" | awk -F: '{print $2}' | awk '{print $1}')
     APPLY_DELAY=$(echo "$DG_OUT" | grep "Apply Delay:" | awk -F: '{print $2}' | awk '{print $1}')
 
     [[ "$APPLY_STATE" == "Running" && "$APPLY_LAG" -eq 0 && "$APPLY_DELAY" -eq 0 ]] \
       && report "OK" "[$STBY] Apply Healthy" \
-      || report "CRITICAL" "[$STBY] Apply Issue"
+      || report "CRITICAL" "[$STBY] Apply Issue: State=$APPLY_STATE Lag=${APPLY_LAG}s Delay=${APPLY_DELAY}m"
 
+    ################ TRANSPORT ################
     TRANSPORT_ON=$(echo "$DG_OUT" | grep "Transport On:" | awk -F: '{print $2}' | xargs)
     GAP_STATUS=$(echo "$DG_OUT" | grep "Gap Status:" | awk -F: '{print $2}' | xargs)
     TRANSPORT_LAG=$(echo "$DG_OUT" | grep "Transport Lag:" | awk -F: '{print $2}' | awk '{print $1}')
@@ -167,17 +165,50 @@ EOF
       && report "OK" "[$STBY] Transport Healthy" \
       || report "CRITICAL" "[$STBY] Transport Issue"
 
-    THREAD_BLOCK=$(echo "$DG_OUT" | \
-      awk '/Current Log File Groups Configuration:/,/Future Log File Groups Configuration:/')
-
-    echo "$THREAD_BLOCK" | awk '/^[0-9]+/' | while read -r THREAD ONLINE SRL STATUS; do
+    ################ SRL +1 RULE ################
+    CURRENT_BLOCK=$(echo "$DG_OUT" | awk '/Current Log File Groups Configuration:/,/Future Log File Groups Configuration:/')
+    echo "$CURRENT_BLOCK" | awk '/^[0-9]+/' | while read -r THREAD ONLINE SRL STATUS; do
       REQUIRED=$((ONLINE + 1))
       [[ "$SRL" -ge "$REQUIRED" ]] \
-        && report "OK" "[$STBY] Thread $THREAD SRL OK" \
-        || report "CRITICAL" "[$STBY] Thread $THREAD SRL insufficient"
+        && report "OK" "[$STBY] Thread $THREAD SRL OK ($SRL >= $REQUIRED)" \
+        || report "CRITICAL" "[$STBY] Thread $THREAD SRL insufficient ($SRL < $REQUIRED)"
+    done
+
+    ################ REDO SIZE MATCH ################
+    SIZE_BLOCK=$(echo "$DG_OUT" | awk '/Current Configuration Log File Sizes:/,/Future Configuration Log File Sizes:/')
+    echo "$SIZE_BLOCK" | awk '/^[0-9]+/' | while read -r THREAD ONLINE_SIZE UNIT1 STBY_SIZE UNIT2; do
+      [[ "$ONLINE_SIZE" == "$STBY_SIZE" ]] \
+        && report "OK" "[$STBY] Redo Size Match ($ONLINE_SIZE)" \
+        || report "CRITICAL" "[$STBY] Redo Size Mismatch"
     done
 
   done
+}
+
+
+  # Extract the ARCHIVELOG DELETION POLICY line
+  local ACTUAL_LINE
+  ACTUAL_LINE=$(printf '%s\n' "$RMAN_OUT" | \
+    grep -i '^CONFIGURE ARCHIVELOG DELETION POLICY' | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//')
+
+  if [[ -z "$ACTUAL_LINE" ]]; then
+    report "CRITICAL" "RMAN ARCHIVELOG DELETION POLICY not configured or not visible in SHOW ALL"
+    return
+  fi
+
+  # Expected configuration (including DISK)
+  local EXPECTED="CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK;"
+
+  # Normalize case and spaces for robust comparison
+  local NORM_ACTUAL NORM_EXPECTED
+  NORM_ACTUAL=$(echo "$ACTUAL_LINE" | tr '[:lower:]' '[:upper:]' | tr -s ' ')
+  NORM_EXPECTED=$(echo "$EXPECTED"  | tr '[:lower:]' '[:upper:]' | tr -s ' ')
+
+  if [[ "$NORM_ACTUAL" == "$NORM_EXPECTED" ]]; then
+    report "OK" "RMAN: $ACTUAL_LINE"
+  else
+    report "CRITICAL" "RMAN ARCHIVELOG DELETION POLICY mismatch. Current: [$ACTUAL_LINE] | Expected: [$EXPECTED]"
+  fi
 }
 
 #######################################
@@ -189,7 +220,13 @@ ORACLE_SID="$1"
 DATE=$(date '+%Y%m%d_%H%M%S')
 
 ORACLE_HOME=$(get_oracle_home "$ORACLE_SID")
-[[ -z "$ORACLE_HOME" || ! -d "$ORACLE_HOME" ]] && return
+if [[ -z "$ORACLE_HOME" || ! -d "$ORACLE_HOME" ]]; then
+  echo "[CRITICAL] ORACLE_HOME not found for running SID=$ORACLE_SID"
+  return
+fi
+
+# Base DB name for RAC (e.g. RSWPF04A from RSWPF04A1/RSWPF04A2)
+DB_BASE=${ORACLE_SID%[0-9]}
 
 export ORACLE_SID ORACLE_HOME
 export PATH=$ORACLE_HOME/bin:/usr/bin:/usr/sbin
@@ -199,6 +236,9 @@ export TNS_ADMIN=$ORACLE_HOME/network/admin
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/db_health_${ORACLE_SID}_${DATE}.log"
 
+#######################################
+# HEADER
+#######################################
 echo "===================================================="
 echo " Oracle DB Health Check Started"
 echo " SID : $ORACLE_SID"
@@ -448,12 +488,15 @@ if [[ "$IS_RAC" == "YES" ]]; then
   done
 fi
 
+#######################################
+# RMAN ARCHIVELOG DELETION POLICY CHECK (ADDED)
+#######################################
 check_rman_archivelog_policy
 check_dg_broker
-
 report "INFO" "Health check completed"
 report "INFO" "Log file: $LOG_FILE"
 }
+
 
 #######################################
 # MAIN
