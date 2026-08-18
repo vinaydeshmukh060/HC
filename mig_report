@@ -1,0 +1,259 @@
+#!/bin/sh
+# ==============================================================================
+# Script Name : oracle_migration_check.sh
+# Purpose     : Oracle Schema Pre & Post Migration Verification & HTML Report
+# OS Support  : Linux (RHEL/OEL/SUSE/Ubuntu) & Solaris (SunOS)
+# Usage       : 
+#   Pre-Check : ./oracle_migration_check.sh pre  <ORACLE_SID> <SCHEMA_NAME>
+#   Post-Check: ./oracle_migration_check.sh post <ORACLE_SID> <SCHEMA_NAME> <EMAIL_TO>
+# ==============================================================================
+
+MODE=$1
+TARGET_SID=$2
+SCHEMA=$(echo "$3" | tr '[:lower:]' '[:upper:]')
+EMAIL_TO=$4
+
+WORKDIR="./mig_check_${SCHEMA}"
+mkdir -p "${WORKDIR}"
+
+# ------------------------------------------------------------------------------
+# 1. OS & Oratab Detection (Linux vs Solaris)
+# ------------------------------------------------------------------------------
+if [ -f /etc/oratab ]; then
+    ORATAB="/etc/oratab"
+elif [ -f /var/opt/oracle/oratab ]; then
+    ORATAB="/var/opt/oracle/oratab"
+else
+    echo "ERROR: oratab file not found in /etc or /var/opt/oracle!"
+    exit 1
+fi
+
+# Detect AWK binary (Solaris nawk fallback)
+if [ -x /usr/bin/nawk ]; then
+    AWK="/usr/bin/nawk"
+else
+    AWK="awk"
+fi
+
+# ------------------------------------------------------------------------------
+# 2. Environment Setup Function
+# ------------------------------------------------------------------------------
+set_oracle_env() {
+    if [ -z "$TARGET_SID" ]; then
+        echo "ERROR: ORACLE_SID not provided."
+        exit 1
+    fi
+
+    # Extract ORACLE_HOME from oratab
+    ORACLE_HOME=$(grep -v '^#' "$ORATAB" | grep -v '^$' | grep -i "^${TARGET_SID}:" | cut -d: -f2 | head -n 1)
+
+    if [ -z "$ORACLE_HOME" ]; then
+        echo "ERROR: SID '${TARGET_SID}' not found in ${ORATAB}!"
+        exit 1
+    fi
+
+    export ORACLE_SID=$TARGET_SID
+    export ORACLE_HOME=$ORACLE_HOME
+    export PATH=$ORACLE_HOME/bin:$PATH
+    export LD_LIBRARY_PATH=$ORACLE_HOME/lib:${LD_LIBRARY_PATH}
+
+    echo "--> Environment set: ORACLE_SID=${ORACLE_SID}, ORACLE_HOME=${ORACLE_HOME}"
+}
+
+# ------------------------------------------------------------------------------
+# 3. Database Data Extraction Function
+# ------------------------------------------------------------------------------
+collect_metrics() {
+    OUTPUT_FILE=$1
+    echo "--> Querying metrics for schema: ${SCHEMA}..."
+
+    sqlplus -s / as sysdba <<EOF > "$OUTPUT_FILE"
+SET PAGESIZE 0 FEEDBACK OFF TRIMSPOOL ON LINESIZE 500 VERIFY OFF ECHO OFF;
+
+-- Section 1: Object Counts by Type
+SELECT 'OBJ_COUNT|' || object_type || '|' || COUNT(*)
+FROM dba_objects 
+WHERE owner = '${SCHEMA}' 
+GROUP BY object_type;
+
+-- Section 2: Invalid Objects
+SELECT 'INVALID_OBJ|' || object_type || '|' || COUNT(*)
+FROM dba_objects 
+WHERE owner = '${SCHEMA}' AND status = 'INVALID'
+GROUP BY object_type;
+
+-- Section 3: Index Status
+SELECT 'INDEX_STATUS|' || status || '|' || COUNT(*)
+FROM dba_indexes 
+WHERE owner = '${SCHEMA}'
+GROUP BY status;
+
+-- Section 4: Constraint Counts by Status
+SELECT 'CONSTRAINT_STATUS|' || constraint_type || '_' || status || '|' || COUNT(*)
+FROM dba_constraints 
+WHERE owner = '${SCHEMA}'
+GROUP BY constraint_type, status;
+
+-- Section 5: Trigger Status
+SELECT 'TRIGGER_STATUS|' || status || '|' || COUNT(*)
+FROM dba_triggers 
+WHERE owner = '${SCHEMA}'
+GROUP BY status;
+
+-- Section 6: Object Privileges Granted
+SELECT 'OBJ_GRANTS|GRANTED_PRIVS|' || COUNT(*)
+FROM dba_tab_privs 
+WHERE grantee = '${SCHEMA}' OR owner = '${SCHEMA}';
+
+-- Section 7: Table Row Counts (Sample / Stats based)
+SELECT 'ROW_COUNT|' || table_name || '|' || NVL(num_rows, 0)
+FROM dba_tables
+WHERE owner = '${SCHEMA}';
+
+EXIT;
+EOF
+
+    if [ ! -s "$OUTPUT_FILE" ]; then
+        echo "ERROR: Failed to collect database metrics or output is empty!"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 4. Generate HTML Report & Send Email
+# ------------------------------------------------------------------------------
+generate_and_send_html() {
+    PRE_FILE="${WORKDIR}/pre_metrics_${SCHEMA}.dat"
+    POST_FILE="${WORKDIR}/post_metrics_${SCHEMA}.dat"
+    HTML_FILE="${WORKDIR}/migration_report_${SCHEMA}.html"
+
+    if [ ! -f "$PRE_FILE" ]; then
+        echo "ERROR: Pre-check file ${PRE_FILE} not found! Run 'pre' mode first."
+        exit 1
+    fi
+
+    echo "--> Generating HTML comparison report..."
+
+    $AWK -F'|' -v schema="$SCHEMA" '
+    BEGIN {
+        print "<html><head><style>"
+        print "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f6f9; }"
+        print "h2 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 5px; }"
+        print "table { border-collapse: collapse; width: 80%; margin-bottom: 25px; background: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
+        print "th, td { border: 1px solid #dddddd; text-align: left; padding: 10px; }"
+        print "th { background-color: #3498db; color: white; }"
+        print "tr:nth-child(even) { background-color: #f8f9fa; }"
+        print ".match { background-color: #d4edda; color: #155724; font-weight: bold; text-align: center; }"
+        print ".mismatch { background-color: #f8d7da; color: #721c24; font-weight: bold; text-align: center; }"
+        print "</style></head><body>"
+        print "<h2>Oracle Schema Migration Comparison Report: " schema "</h2>"
+        print "<p>Report Generated on: " strftime("%Y-%m-%d %H:%M:%S") "</p>"
+    }
+
+    # Process Pre-file
+    NR == FNR {
+        if (NF == 3) {
+            key = $1 "||" $2
+            pre[key] = $3
+            categories[$1] = 1
+            items[key] = $2
+            category_map[key] = $1
+        }
+        next
+    }
+
+    # Process Post-file
+    {
+        if (NF == 3) {
+            key = $1 "||" $2
+            post[key] = $3
+            categories[$1] = 1
+            items[key] = $2
+            category_map[key] = $1
+        }
+    }
+
+    END {
+        for (cat in categories) {
+            print "<h3>Category: " cat "</h3>"
+            print "<table>"
+            print "<tr><th>Metric / Object</th><th>Pre-Migration</th><th>Post-Migration</th><th>Status</th></tr>"
+            
+            for (key in items) {
+                if (category_map[key] == cat) {
+                    val_pre = (key in pre) ? pre[key] : 0
+                    val_post = (key in post) ? post[key] : 0
+                    
+                    if (val_pre == val_post) {
+                        status = "<td class=\"match\">MATCH</td>"
+                    } else {
+                        status = "<td class=\"mismatch\">MISMATCH</td>"
+                    }
+                    
+                    print "<tr><td>" items[key] "</td><td>" val_pre "</td><td>" val_post "</td>" status "</tr>"
+                }
+            }
+            print "</table>"
+        }
+        print "</body></html>"
+    }' "$PRE_FILE" "$POST_FILE" > "$HTML_FILE"
+
+    echo "--> HTML report generated at: ${HTML_FILE}"
+
+    # Send Email via sendmail (Cross-platform standard)
+    if [ -n "$EMAIL_TO" ]; then
+        echo "--> Sending email to ${EMAIL_TO}..."
+        
+        SENDMAIL_BIN=""
+        if [ -x /usr/sbin/sendmail ]; then
+            SENDMAIL_BIN="/usr/sbin/sendmail"
+        elif [ -x /usr/lib/sendmail ]; then
+            SENDMAIL_BIN="/usr/lib/sendmail"
+        fi
+
+        if [ -n "$SENDMAIL_BIN" ]; then
+            $SENDMAIL_BIN -t <<EOF
+To: ${EMAIL_TO}
+Subject: Migration Comparison Report - Schema: ${SCHEMA} (${TARGET_SID})
+MIME-Version: 1.0
+Content-Type: text/html; charset=UTF-8
+
+$(cat "${HTML_FILE}")
+EOF
+            echo "--> Email successfully dispatched!"
+        else
+            echo "WARNING: sendmail binary not found. Skipping email delivery."
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 5. Execution Flow Logic
+# ------------------------------------------------------------------------------
+case "$MODE" in
+    pre)
+        if [ -z "$TARGET_SID" ] || [ -z "$SCHEMA" ]; then
+            echo "Usage: $0 pre <ORACLE_SID> <SCHEMA_NAME>"
+            exit 1
+        fi
+        set_oracle_env
+        collect_metrics "${WORKDIR}/pre_metrics_${SCHEMA}.dat"
+        echo "--> PRE-migration metrics collected successfully."
+        ;;
+    post)
+        if [ -z "$TARGET_SID" ] || [ -z "$SCHEMA" ]; then
+            echo "Usage: $0 post <ORACLE_SID> <SCHEMA_NAME> [EMAIL_TO]"
+            exit 1
+        fi
+        set_oracle_env
+        collect_metrics "${WORKDIR}/post_metrics_${SCHEMA}.dat"
+        echo "--> POST-migration metrics collected successfully."
+        generate_and_send_html
+        ;;
+    *)
+        echo "Usage:"
+        echo "  Pre-Migration : $0 pre  <ORACLE_SID> <SCHEMA_NAME>"
+        echo "  Post-Migration: $0 post <ORACLE_SID> <SCHEMA_NAME> <EMAIL_ADDRESS>"
+        exit 1
+        ;;
+esac
