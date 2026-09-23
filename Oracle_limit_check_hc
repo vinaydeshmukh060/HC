@@ -1,0 +1,169 @@
+SET SERVEROUTPUT ON SIZE 1000000 FORMAT WRAPPED
+SET LINESIZE 200
+SET VERIFY OFF
+
+DECLARE
+    v_count      NUMBER;
+    v_scn        NUMBER;
+    v_obj_id     NUMBER;
+    v_pct        NUMBER(5,2);
+    v_pct_scn    NUMBER(9,6);
+    v_found      BOOLEAN;
+    
+    -- Hard limits constants (Oracle 19c+)
+    c_max_files  CONSTANT NUMBER := 65533;
+    c_max_tsf    CONSTANT NUMBER := 1022;
+    c_max_cols   CONSTANT NUMBER := 1000;
+    c_max_idx    CONSTANT NUMBER := 32;
+    c_max_part   CONSTANT NUMBER := 1048575;
+    c_max_obj    CONSTANT NUMBER := 4254950911;
+    c_max_scn    CONSTANT NUMBER := 9223090561878065152;
+BEGIN
+    DBMS_OUTPUT.PUT_LINE(RPAD('=', 85, '='));
+    DBMS_OUTPUT.PUT_LINE('ORACLE COMPREHENSIVE LIMITS HEALTH CHECK REPORT (INC. INTERVAL PARTITIONS)');
+    DBMS_OUTPUT.PUT_LINE(RPAD('=', 85, '='));
+
+    -- 1. SYSTEM RESOURCE LIMITS (v$resource_limit)
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '--- 1. INSTANCE RESOURCE LIMITS ---');
+    v_found := FALSE;
+    FOR r IN (
+        SELECT resource_name, current_utilization, limit_value,
+               ROUND((current_utilization / TO_NUMBER(limit_value)) * 100, 2) AS pct
+        FROM v$resource_limit
+        WHERE limit_value NOT IN ('0', 'UNLIMITED')
+          AND current_utilization > 0
+    ) LOOP
+        IF r.pct > 75 THEN
+            DBMS_OUTPUT.PUT_LINE('WARNING: ' || RPAD(r.resource_name, 20) || 
+                                 ' is at ' || r.pct || '% of limit (' || r.limit_value || ')');
+            v_found := TRUE;
+        END IF;
+    END LOOP;
+    IF NOT v_found THEN 
+        DBMS_OUTPUT.PUT_LINE('OK: All v$resource_limit metrics are well below 75% thresholds.'); 
+    END IF;
+
+    -- 2. PHYSICAL LIMITS (Datafiles)
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '--- 2. PHYSICAL DATABASE LIMITS ---');
+    SELECT COUNT(*) INTO v_count FROM dba_data_files;
+    v_pct := ROUND((v_count / c_max_files) * 100, 2);
+    DBMS_OUTPUT.PUT_LINE('Total Datafiles: ' || v_count || ' / ' || c_max_files || ' (' || v_pct || '%)');
+    
+    v_found := FALSE;
+    FOR t IN (
+        SELECT tablespace_name, COUNT(*) AS file_count
+        FROM dba_data_files
+        GROUP BY tablespace_name
+        HAVING COUNT(*) > (c_max_tsf * 0.75)
+    ) LOOP
+        DBMS_OUTPUT.PUT_LINE('WARNING: Tablespace ' || RPAD(t.tablespace_name, 20) || 
+                             ' has ' || t.file_count || ' files (Limit: ' || c_max_tsf || ')');
+        v_found := TRUE;
+    END LOOP;
+    IF NOT v_found THEN 
+        DBMS_OUTPUT.PUT_LINE('OK: All tablespaces are well under the 1,022 file limit.'); 
+    END IF;
+
+    -- 3. LOGICAL LIMITS (SCN & Object IDs)
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '--- 3. LOGICAL DATABASE LIMITS (GLOBAL) ---');
+    
+    SELECT current_scn INTO v_scn FROM v$database;
+    v_pct_scn := ROUND((v_scn / c_max_scn) * 100, 6);
+    DBMS_OUTPUT.PUT_LINE('Current SCN Usage: ' || v_scn || ' / ' || c_max_scn || ' (' || v_pct_scn || '%)');
+
+    SELECT MAX(object_id) INTO v_obj_id FROM dba_objects;
+    v_pct := ROUND((v_obj_id / c_max_obj) * 100, 2);
+    DBMS_OUTPUT.PUT_LINE('Max Object ID:     ' || v_obj_id || ' / ' || c_max_obj || ' (' || v_pct || '%)');
+
+    -- 4. LOGICAL LIMITS (Tables, Columns, Indexes, Partitions)
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '--- 4. LOGICAL LIMITS (SCHEMA OBJECTS) ---');
+    v_found := FALSE;
+    
+    -- Check Columns (> 800)
+    FOR c IN (
+        SELECT owner, table_name, COUNT(*) AS cnt
+        FROM dba_tab_cols
+        WHERE owner NOT IN ('SYS', 'SYSTEM')
+        GROUP BY owner, table_name
+        HAVING COUNT(*) > (c_max_cols * 0.80)
+    ) LOOP
+        DBMS_OUTPUT.PUT_LINE('WARNING: Table ' || c.owner || '.' || c.table_name || 
+                             ' has ' || c.cnt || ' columns (Limit: ' || c_max_cols || ')');
+        v_found := TRUE;
+    END LOOP;
+    
+    -- Check Index Columns (> 25)
+    FOR i IN (
+        SELECT index_owner, index_name, COUNT(*) cnt
+        FROM dba_ind_columns
+        WHERE index_owner NOT IN ('SYS', 'SYSTEM')
+        GROUP BY index_owner, index_name
+        HAVING COUNT(*) > (c_max_idx * 0.80)
+    ) LOOP
+        DBMS_OUTPUT.PUT_LINE('WARNING: Index ' || i.index_owner || '.' || i.index_name || 
+                             ' has ' || i.cnt || ' columns (Limit: ' || c_max_idx || ')');
+        v_found := TRUE;
+    END LOOP;
+
+    -- Check Physical Partitions (> 50,000)
+    FOR p IN (
+        SELECT owner, object_name, COUNT(*) AS cnt
+        FROM dba_objects
+        WHERE object_type LIKE '%PARTITION%'
+          AND owner NOT IN ('SYS', 'SYSTEM')
+        GROUP BY owner, object_name
+        HAVING COUNT(*) > 50000
+    ) LOOP
+        DBMS_OUTPUT.PUT_LINE('WARNING: Object ' || p.owner || '.' || p.object_name || 
+                             ' has ' || p.cnt || ' physical partitions (Limit: ' || c_max_part || ')');
+        v_found := TRUE;
+    END LOOP;
+
+    -- Check Interval Partitions Logical Mapping Limit (> 50% used)
+    FOR ip IN (
+        SELECT 
+            pt.owner, 
+            pt.table_name,
+            MAX(tp.partition_position) AS max_pos,
+            FLOOR(c_max_part / NVL(pt.def_subpartition_count, 1)) AS eff_limit,
+            ROUND((MAX(tp.partition_position) / FLOOR(c_max_part / NVL(pt.def_subpartition_count, 1))) * 100, 2) AS pct
+        FROM dba_part_tables pt
+        JOIN dba_tab_partitions tp ON pt.owner = tp.table_owner AND pt.table_name = tp.table_name
+        WHERE pt.interval IS NOT NULL
+          AND pt.owner NOT IN ('SYS', 'SYSTEM')
+        GROUP BY pt.owner, pt.table_name, pt.def_subpartition_count
+        HAVING ROUND((MAX(tp.partition_position) / FLOOR(c_max_part / NVL(pt.def_subpartition_count, 1))) * 100, 2) > 50
+    ) LOOP
+        DBMS_OUTPUT.PUT_LINE('WARNING: Interval Table ' || ip.owner || '.' || ip.table_name || 
+                             ' mapped logical limit is at ' || ip.pct || '% (Mapped: ' || ip.max_pos || ' / ' || ip.eff_limit || ')');
+        v_found := TRUE;
+    END LOOP;
+    
+    IF NOT v_found THEN 
+        DBMS_OUTPUT.PUT_LINE('OK: All schema objects (columns, physical partitions, logical interval maps) are safe.'); 
+    END IF;
+
+    -- 5. LOGICAL LIMITS (Sequences)
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || '--- 5. LOGICAL LIMITS (SEQUENCES) ---');
+    v_found := FALSE;
+    FOR s IN (
+        SELECT sequence_owner, sequence_name, last_number, max_value,
+               ROUND((last_number / max_value) * 100, 2) AS pct
+        FROM dba_sequences
+        WHERE max_value > 0 
+          AND sequence_owner NOT IN ('SYS', 'SYSTEM', 'XDB')
+          AND (last_number / max_value) > 0.80
+    ) LOOP
+        DBMS_OUTPUT.PUT_LINE('WARNING: Sequence ' || s.sequence_owner || '.' || s.sequence_name || 
+                             ' is at ' || s.pct || '% of MAX_VALUE');
+        v_found := TRUE;
+    END LOOP;
+    IF NOT v_found THEN 
+        DBMS_OUTPUT.PUT_LINE('OK: All application sequences are below 80% of their MAX_VALUE.'); 
+    END IF;
+
+    DBMS_OUTPUT.PUT_LINE(CHR(10) || RPAD('=', 85, '='));
+    DBMS_OUTPUT.PUT_LINE('END OF REPORT');
+    DBMS_OUTPUT.PUT_LINE(RPAD('=', 85, '='));
+END;
+/
